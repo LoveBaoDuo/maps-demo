@@ -4,10 +4,10 @@ import MapView, {Marker, PROVIDER_GOOGLE} from 'react-native-maps';
 import MapViewDirections from 'react-native-maps-directions';
 import * as Location from 'expo-location';
 import * as Speech from 'expo-speech';
-import * as Battery from 'expo-battery';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {NavigationModes} from './NavigationModes';
 import {SettingsPanel} from './SettingsPanel';
+import UserLocationMarker from "@/screens/NavigationScreen/UserLocationMarker";
 import {
     Coordinates,
     NavigationProps,
@@ -18,9 +18,11 @@ import {
 import {checkLocationPermission, checkLocationServices} from "@/utils/permissions";
 import {NavigationPanel} from "@/screens/NavigationScreen/NavigationPanel";
 import {findNearestStep} from "@/utils/navigationUtils";
-import {decode} from 'html-entities'; // 处理 HTML 实体
+import {decode} from 'html-entities';
+import {useLoading} from "@/components/Loading/LoadingContext"; // 处理 HTML 实体
 
 const NavigationScreen: React.FC<NavigationProps> = ({destination}) => {
+    const {showLoading, hideLoading} = useLoading()
     const mapRef = useRef<MapView | null>(null);
     const [origin, setOrigin] = useState<Coordinates | null>(null);
     const [isNavigating, setIsNavigating] = useState<boolean>(false);
@@ -48,7 +50,7 @@ const NavigationScreen: React.FC<NavigationProps> = ({destination}) => {
     useEffect(() => {
         loadSettings();
     }, []);
-
+    // 保存设置
     const saveSettings = async (): Promise<void> => {
         try {
             await AsyncStorage.setItem('navigationSettings', JSON.stringify(settings));
@@ -56,7 +58,7 @@ const NavigationScreen: React.FC<NavigationProps> = ({destination}) => {
             console.error('保存设置失败:', error);
         }
     };
-
+    // 加载设置
     const loadSettings = async (): Promise<void> => {
         try {
             const savedSettings = await AsyncStorage.getItem('navigationSettings');
@@ -68,23 +70,6 @@ const NavigationScreen: React.FC<NavigationProps> = ({destination}) => {
         }
     };
 
-    const getLocationUpdateConfig = async (): Promise<Location.LocationOptions> => {
-        const batteryLevel = await Battery.getBatteryLevelAsync();
-        const isCharging = await Battery.isChargingAsync();
-        if (!settings.batteryOptimization || isCharging || batteryLevel > 0.2) {
-            return {
-                accuracy: Location.Accuracy.High,
-                timeInterval: 1000,
-                distanceInterval: 10,
-            };
-        } else {
-            return {
-                accuracy: Location.Accuracy.Balanced,
-                timeInterval: 3000,
-                distanceInterval: 30,
-            };
-        }
-    };
     useEffect(() => {
         const checkPermissions = async () => {
 
@@ -114,39 +99,47 @@ const NavigationScreen: React.FC<NavigationProps> = ({destination}) => {
                 Alert.alert('错误', '无法获取位置权限');
                 return;
             }
-            // const config = await getLocationUpdateConfig();
+            showLoading()
+            try {
+                // 获取当前定位坐标
+                const initialLocation = await Location.getCurrentPositionAsync(config);
+                const coords: Coordinates = {
+                    latitude: initialLocation.coords.latitude,
+                    longitude: initialLocation.coords.longitude,
+                    heading: initialLocation.coords.heading,
+                };
+                // 设置初始坐标
+                setOrigin(coords);
+                // 设置当前坐标
+                setCurrentLocation(coords);
+                // 定位监听
+                locationSubscription = await Location.watchPositionAsync(
+                    config,
+                    (location) => {
+                        const newCoords: { heading: number | null; latitude: number; longitude: number } = {
+                            latitude: location.coords.latitude,
+                            longitude: location.coords.longitude,
+                            heading: location.coords.heading,
+                        };
+                        setCurrentLocation(newCoords);
+                        // 找到最近的步骤
+                        const nearestIndex = findNearestStep(newCoords, routeInfo.steps);
 
-            const initialLocation = await Location.getCurrentPositionAsync(config);
-            const coords: Coordinates = {
-                latitude: initialLocation.coords.latitude,
-                longitude: initialLocation.coords.longitude,
-            };
-
-            setOrigin(coords);
-            setCurrentLocation(coords);
-
-            locationSubscription = await Location.watchPositionAsync(
-                config,
-                (location) => {
-                    const newCoords: Coordinates = {
-                        latitude: location.coords.latitude,
-                        longitude: location.coords.longitude,
-                    };
-                    setCurrentLocation(newCoords);
-                    // 找到最近的步骤
-                    const nearestIndex = findNearestStep(newCoords, routeInfo.steps);
-
-                    updateCurrentStep(nearestIndex);
-                    // 可以添加提示逻辑
-                    if (nearestIndex !== routeInfo.currentStepIndex) {
-                        // 播放语音提示或显示提示信息
-                        speakInstruction(routeInfo.steps[nearestIndex].instruction);
+                        updateCurrentStep(nearestIndex);
+                        // 可以添加提示逻辑
+                        if (nearestIndex !== routeInfo.currentStepIndex) {
+                            // 播放语音提示或显示提示信息
+                            speakInstruction(routeInfo.steps[nearestIndex].instruction);
+                        }
+                        if (isNavigating) {
+                            updateNavigationInfo(newCoords);
+                        }
                     }
-                    if (isNavigating) {
-                        updateNavigationInfo(newCoords);
-                    }
-                }
-            );
+                );
+            } finally {
+                hideLoading()
+            }
+
         };
 
         startLocationUpdates();
@@ -158,6 +151,7 @@ const NavigationScreen: React.FC<NavigationProps> = ({destination}) => {
         };
     }, [isNavigating, settings.batteryOptimization]);
 
+    // 语音播报
     const speakInstruction = async (instruction: string): Promise<void> => {
         if (settings?.voiceEnabled && instruction !== lastVoiceInstruction) {
             try {
@@ -172,7 +166,7 @@ const NavigationScreen: React.FC<NavigationProps> = ({destination}) => {
             }
         }
     };
-
+    // 更新导航信息
     const updateNavigationInfo = async (currentCoords: Coordinates): Promise<void> => {
         if (!destination || offlineMode) return;
 
@@ -202,30 +196,28 @@ const NavigationScreen: React.FC<NavigationProps> = ({destination}) => {
             }
         }
     };
-
-    const startNavigation = async (): Promise<void> => {
-        if (!currentLocation) return;
-        setIsNavigating(true);
+    // 相机跟随
+    const cameraFollow = () => {
         if (mapRef.current) {
             const camera = {
                 center: currentLocation,
                 pitch: 45,
-                heading: 0,
+                heading: currentLocation?.heading || 0,
                 zoom: 18,
             };
-            mapRef.current?.animateCamera(camera);
+            mapRef.current?.animateCamera(camera as any);
         }
+    }
+    // 开始导航
+    const startNavigation = async (): Promise<void> => {
+        if (!currentLocation) return;
+        setIsNavigating(true);
+        cameraFollow()
         speakInstruction('导航开始');
     };
-
+    // 停止导航
     const stopNavigation = (): void => {
         setIsNavigating(false);
-        // setRouteInfo((prev) => ({
-        //     ...prev,
-        //     distance: '',
-        //     duration: '',
-        //     nextInstruction: ''
-        // }));
         Speech.stop();
     };
 // 更新当前步骤的函数
@@ -248,6 +240,12 @@ const NavigationScreen: React.FC<NavigationProps> = ({destination}) => {
             setNavigationMode(value as NavigationMode);
         }
     };
+    // 2. 平滑过渡
+    useEffect(() => {
+        if (currentLocation) {
+            cameraFollow();
+        }
+    }, [currentLocation?.heading]);
     // 处理 HTML 指令文本
     const parseHtmlInstructions = (htmlInstructions: string): string => {
         // 1. 移除 HTML 标签
@@ -301,9 +299,11 @@ const NavigationScreen: React.FC<NavigationProps> = ({destination}) => {
                         ref={mapRef}
                         style={styles.map}
                         provider={PROVIDER_GOOGLE}
-                        showsUserLocation={true}
+                        showsUserLocation={false}
                         followsUserLocation={isNavigating}
                         showsTraffic={settings.showTraffic}
+                        showsCompass={false}
+                        rotateEnabled={true}
                         initialRegion={{
                             ...currentLocation,
                             latitudeDelta: 0.0922,
@@ -317,7 +317,9 @@ const NavigationScreen: React.FC<NavigationProps> = ({destination}) => {
                                     origin={currentLocation}
                                     destination={destination}
                                     apikey={process.env.EXPO_PUBLIC_GOOGLE_CLOUD_API_KEY}
-                                    strokeWidth={3}
+                                    strokeWidth={10}
+                                    splitWaypoints={true}
+
                                     strokeColor="#4A89F3"
                                     mode={navigationMode}
                                     onReady={result => {
@@ -341,6 +343,7 @@ const NavigationScreen: React.FC<NavigationProps> = ({destination}) => {
                                         }) as RouteInfo);
                                     }}
                                 />
+                                <UserLocationMarker currentLocation={currentLocation}/>
                             </>
                         )}
                     </MapView>
